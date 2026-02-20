@@ -1,28 +1,23 @@
 const std = @import("std");
-const crypto = std.crypto;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const mem = std.mem;
 
 const WORDLIST_STR = @embedFile("english.txt");
+const WORDLIST_SIZE = 2048;
+const BITS_PER_WORD = 11;
 
 const WORDLIST = blk: {
     @setEvalBranchQuota(100000);
-    var words: [2048][]const u8 = undefined;
+    var words: [WORDLIST_SIZE][]const u8 = undefined;
     var i: usize = 0;
-    var iterator = mem.tokenizeScalar(u8, WORDLIST_STR, '\n');
-    while (iterator.next()) |word| : (i += 1) {
-        if (i >= words.len) {
-            @compileError("Wordlist contains more than 2048 words");
-        }
+    var iter = mem.tokenizeScalar(u8, WORDLIST_STR, '\n');
+    while (iter.next()) |word| : (i += 1) {
+        if (i >= words.len) @compileError("Wordlist contains more than 2048 words");
         words[i] = word;
     }
-    if (i != words.len) {
-        @compileError("Wordlist contains fewer than 2048 words");
-    }
+    if (i != words.len) @compileError("Wordlist contains fewer than 2048 words");
     break :blk words;
 };
-
-const ENT_128 = 16;
-const ENT_256 = 32;
 
 const Command = enum {
     generate,
@@ -30,10 +25,11 @@ const Command = enum {
     help,
 
     fn parse(str: ?[]const u8) Command {
-        if (str == null) return .help;
-        if (mem.eql(u8, str.?, "generate")) return .generate;
-        if (mem.eql(u8, str.?, "validate")) return .validate;
-        if (mem.eql(u8, str.?, "help")) return .help;
+        const s = str orelse return .help;
+        const cmds = .{ .{ "generate", .generate }, .{ "validate", .validate }, .{ "help", .help } };
+        inline for (cmds) |entry| {
+            if (mem.eql(u8, s, entry[0])) return entry[1];
+        }
         return .help;
     }
 };
@@ -48,63 +44,59 @@ pub fn main() !void {
 
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
-    _ = args.next(); // Skip program name
+    _ = args.next();
 
     switch (Command.parse(args.next())) {
-        .generate => try handleGenerate(allocator, &args, stdout, stderr),
-        .validate => try handleValidate(allocator, &args, stdout, stderr),
+        .generate => try handleGenerate(&args, stdout, stderr),
+        .validate => try handleValidate(&args, stdout, stderr),
         .help => try printUsage(stdout),
     }
 }
 
-fn handleGenerate(allocator: mem.Allocator, args: anytype, stdout: anytype, stderr: anytype) !void {
-    var word_count: u8 = 12;
+fn handleGenerate(args: anytype, stdout: anytype, stderr: anytype) !void {
+    var entropy_len: usize = 16;
 
     if (args.next()) |count| {
         if (mem.eql(u8, count, "24")) {
-            word_count = 24;
+            entropy_len = 32;
         } else if (!mem.eql(u8, count, "12")) {
             try stderr.print("Invalid word count: {s}. Defaulting to 12.\n", .{count});
         }
     }
 
-    const entropy_bytes: usize = if (word_count == 12)
-        ENT_128
-    else if (word_count == 24)
-        ENT_256
-    else
-        return error.InvalidWordCount;
+    var entropy_buf: [32]u8 = undefined;
+    const entropy = entropy_buf[0..entropy_len];
+    std.crypto.random.bytes(entropy);
 
-    var entropy_buffer: [ENT_256]u8 = undefined;
-    const entropy = entropy_buffer[0..entropy_bytes];
-    crypto.random.bytes(entropy);
-
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, entropy, hash[0]);
-    defer allocator.free(phrase);
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(entropy, &buf);
     try stdout.print("{s}\n", .{phrase});
 }
 
-fn handleValidate(allocator: mem.Allocator, args: anytype, stdout: anytype, stderr: anytype) !void {
-    var phrase = std.ArrayList(u8).init(allocator);
-    defer phrase.deinit();
+fn handleValidate(args: anytype, stdout: anytype, stderr: anytype) !void {
+    var phrase_buf: [1024]u8 = undefined;
+    var pos: usize = 0;
 
-    var first = true;
     while (args.next()) |word| {
-        if (!first) try phrase.append(' ');
-        try phrase.appendSlice(word);
-        first = false;
+        if (pos > 0) {
+            phrase_buf[pos] = ' ';
+            pos += 1;
+        }
+        if (pos + word.len > phrase_buf.len) {
+            try stderr.print("Input too long.\n", .{});
+            return;
+        }
+        @memcpy(phrase_buf[pos..][0..word.len], word);
+        pos += word.len;
     }
 
-    if (phrase.items.len == 0) {
+    if (pos == 0) {
         try stderr.print("No mnemonic phrase provided for validation.\n", .{});
         try printUsage(stdout);
         return;
     }
 
-    const is_valid = try validateMnemonic(allocator, phrase.items);
+    const is_valid = validateMnemonic(phrase_buf[0..pos]);
     try stdout.print("{s} BIP39 mnemonic phrase.\n", .{if (is_valid) "Valid" else "Invalid"});
 
     if (!is_valid) {
@@ -129,135 +121,92 @@ fn printUsage(writer: anytype) !void {
     );
 }
 
-fn getBits(data: []const u8, checksum: u8, start: usize, cnt: usize, entropy_bits: usize) u11 {
-    var result: u11 = 0;
-
-    var i: usize = 0;
-    while (i < cnt) : (i += 1) {
-        const bit_pos = start + i;
-        const bit = if (bit_pos < entropy_bits)
-            @as(u1, @intCast((data[bit_pos / 8] >> @as(u3, @intCast(7 - (bit_pos % 8)))) & 1))
-        else
-            @as(u1, @intCast((checksum >> @as(u3, @intCast(7 - (bit_pos - entropy_bits)))) & 1));
-
-        result = (result << 1) | bit;
+fn readBit(data: []const u8, checksum: u8, pos: usize, entropy_bits: usize) u1 {
+    if (pos < entropy_bits) {
+        return @intCast((data[pos / 8] >> @as(u3, @intCast(7 - (pos % 8)))) & 1);
     }
+    return @intCast((checksum >> @as(u3, @intCast(7 - (pos - entropy_bits)))) & 1);
+}
 
+fn getBits(data: []const u8, checksum: u8, start: usize, count: usize, entropy_bits: usize) u11 {
+    var result: u11 = 0;
+    for (0..count) |i| {
+        result = (result << 1) | readBit(data, checksum, start + i, entropy_bits);
+    }
     return result;
 }
 
-fn generateMnemonic(allocator: mem.Allocator, entropy: []const u8, checksum_byte: u8) ![]u8 {
-    const entropy_bits = @as(usize, entropy.len * 8);
-    const checksum_bits = @as(usize, @intCast(entropy_bits / 32));
-    const total_bits = entropy_bits + checksum_bits;
-    const total_words = total_bits / 11;
+fn generateMnemonic(entropy: []const u8, buf: []u8) []const u8 {
+    const entropy_bits = entropy.len * 8;
+    const checksum_bits = entropy_bits / 32;
+    const word_count = (entropy_bits + checksum_bits) / BITS_PER_WORD;
 
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var hash: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(entropy, &hash, .{});
 
-    for (0..total_words) |i| {
-        if (i > 0) try result.append(' ');
-
-        const index = getBits(entropy, checksum_byte, i * 11, 11, entropy_bits);
-        try result.appendSlice(WORDLIST[index]);
+    var pos: usize = 0;
+    for (0..word_count) |i| {
+        if (i > 0) {
+            buf[pos] = ' ';
+            pos += 1;
+        }
+        const index = getBits(entropy, hash[0], i * BITS_PER_WORD, BITS_PER_WORD, entropy_bits);
+        const word = WORDLIST[index];
+        @memcpy(buf[pos..][0..word.len], word);
+        pos += word.len;
     }
 
-    return result.toOwnedSlice();
+    return buf[0..pos];
 }
 
 fn wordIndex(word: []const u8) ?u11 {
-    for (WORDLIST, 0..) |wl_word, j| {
-        if (mem.eql(u8, word, wl_word)) {
-            return @as(u11, @intCast(j));
+    var lo: usize = 0;
+    var hi: usize = WORDLIST_SIZE;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const cmp = mem.order(u8, WORDLIST[mid], word);
+        switch (cmp) {
+            .eq => return @intCast(mid),
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
         }
     }
     return null;
 }
 
-fn validateMnemonic(allocator: mem.Allocator, mnemonic: []const u8) !bool {
-    var words = std.ArrayList([]const u8).init(allocator);
-    defer words.deinit();
+fn validateMnemonic(mnemonic: []const u8) bool {
+    var indices: [24]u11 = undefined;
+    var word_count: usize = 0;
 
-    var word_iter = mem.tokenizeScalar(u8, mnemonic, ' ');
-    while (word_iter.next()) |word| {
-        try words.append(word);
+    var iter = mem.tokenizeScalar(u8, mnemonic, ' ');
+    while (iter.next()) |word| {
+        if (word_count >= 24) return false;
+        indices[word_count] = wordIndex(word) orelse return false;
+        word_count += 1;
     }
 
-    const word_count = words.items.len;
-    if (word_count != 12 and word_count != 24) {
-        return false;
-    }
+    if (word_count != 12 and word_count != 24) return false;
 
-    const checksum_bits: usize = word_count / 3;
-    const entropy_bits: usize = word_count * 11 - checksum_bits;
-    const entropy_bytes: usize = entropy_bits / 8;
+    const checksum_bits = word_count / 3;
+    const entropy_bits = word_count * BITS_PER_WORD - checksum_bits;
+    const entropy_bytes = entropy_bits / 8;
 
-    var indices = try allocator.alloc(u11, word_count);
-    defer allocator.free(indices);
-
-    for (words.items, 0..) |word, i| {
-        var found = false;
-        for (WORDLIST, 0..) |wl_word, j| {
-            if (mem.eql(u8, word, wl_word)) {
-                indices[i] = @as(u11, @intCast(j));
-                found = true;
-                break;
-            }
-        }
-
-        if (!found) return false;
-    }
-
-    var entropy = try allocator.alloc(u8, entropy_bytes);
-    defer allocator.free(entropy);
-    @memset(entropy, 0);
-
+    // Extract entropy bytes from word indices
+    var entropy: [32]u8 = .{0} ** 32;
     var bit_idx: usize = 0;
-    for (indices) |idx| {
-        for (0..11) |j| {
+    for (indices[0..word_count]) |idx| {
+        for (0..BITS_PER_WORD) |j| {
             if (bit_idx >= entropy_bits) break;
-
-            const shift = @as(u4, @intCast(10 - j));
-            const bit = @as(u1, @intCast((idx >> shift) & 1));
-
-            const byte_idx = bit_idx / 8;
-            const bit_in_byte = @as(u3, @intCast(7 - (bit_idx % 8)));
-            entropy[byte_idx] |= @as(u8, bit) << bit_in_byte;
-
+            const bit: u8 = @intCast((idx >> @as(u4, @intCast(10 - j))) & 1);
+            entropy[bit_idx / 8] |= bit << @as(u3, @intCast(7 - (bit_idx % 8)));
             bit_idx += 1;
         }
     }
 
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(entropy, &hash, .{});
-
-    bit_idx = 0;
-    var checksum_ok = true;
-    outer: for (indices) |idx| {
-        for (0..11) |j| {
-            if (bit_idx < entropy_bits) {
-                bit_idx += 1;
-                continue;
-            }
-            if (bit_idx >= entropy_bits + checksum_bits) break :outer;
-
-            const checksum_bit_idx = bit_idx - entropy_bits;
-            const bit_in_hash = @as(u3, @intCast(7 - (checksum_bit_idx % 8)));
-            const expected_bit = @as(u1, @intCast((hash[0] >> bit_in_hash) & 1));
-
-            const shift = @as(u4, @intCast(10 - j));
-            const actual_bit = @as(u1, @intCast((idx >> shift) & 1));
-
-            if (expected_bit != actual_bit) {
-                checksum_ok = false;
-                break :outer;
-            }
-
-            bit_idx += 1;
-        }
-    }
-
-    return checksum_ok;
+    // Regenerate from extracted entropy and compare
+    var regen_buf: [1024]u8 = undefined;
+    const regenerated = generateMnemonic(entropy[0..entropy_bytes], &regen_buf);
+    return mem.eql(u8, regenerated, mnemonic);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -322,14 +271,9 @@ test "getBits reads checksum bits beyond entropy" {
 }
 
 test "generateMnemonic with all-zero 128-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         phrase,
@@ -337,14 +281,9 @@ test "generateMnemonic with all-zero 128-bit entropy" {
 }
 
 test "generateMnemonic with all-zero 256-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0} ** 32;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0} ** 32;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
         phrase,
@@ -352,14 +291,9 @@ test "generateMnemonic with all-zero 256-bit entropy" {
 }
 
 test "generateMnemonic with all-FF 128-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0xFF} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0xFF} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
         phrase,
@@ -367,14 +301,9 @@ test "generateMnemonic with all-FF 128-bit entropy" {
 }
 
 test "generateMnemonic with all-FF 256-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0xFF} ** 32;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0xFF} ** 32;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
         phrase,
@@ -382,13 +311,9 @@ test "generateMnemonic with all-FF 256-bit entropy" {
 }
 
 test "generateMnemonic produces 12 words for 128-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0x7f} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
+    const entropy = [_]u8{0x7f} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
 
     var count: usize = 0;
     var iter = mem.tokenizeScalar(u8, phrase, ' ');
@@ -397,13 +322,9 @@ test "generateMnemonic produces 12 words for 128-bit entropy" {
 }
 
 test "generateMnemonic produces 24 words for 256-bit entropy" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0x7f} ** 32;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
+    const entropy = [_]u8{0x7f} ** 32;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
 
     var count: usize = 0;
     var iter = mem.tokenizeScalar(u8, phrase, ' ');
@@ -412,13 +333,9 @@ test "generateMnemonic produces 24 words for 256-bit entropy" {
 }
 
 test "generateMnemonic words are all in wordlist" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0xAB} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
+    const entropy = [_]u8{0xAB} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
 
     var iter = mem.tokenizeScalar(u8, phrase, ' ');
     while (iter.next()) |word| {
@@ -427,83 +344,72 @@ test "generateMnemonic words are all in wordlist" {
 }
 
 test "validateMnemonic accepts valid 12-word all-zero mnemonic" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     );
     try testing.expect(valid);
 }
 
 test "validateMnemonic accepts valid 24-word all-zero mnemonic" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
     );
     try testing.expect(valid);
 }
 
 test "validateMnemonic accepts valid 12-word all-FF mnemonic" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
     );
     try testing.expect(valid);
 }
 
 test "validateMnemonic accepts valid 24-word all-FF mnemonic" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote",
     );
     try testing.expect(valid);
 }
 
 test "validateMnemonic rejects wrong word count (11 words)" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
     );
     try testing.expect(!valid);
 }
 
 test "validateMnemonic rejects wrong word count (13 words)" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about extra",
     );
     try testing.expect(!valid);
 }
 
 test "validateMnemonic rejects invalid words" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword",
     );
     try testing.expect(!valid);
 }
 
 test "validateMnemonic rejects bad checksum" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator,
+    const valid = validateMnemonic(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
     );
     try testing.expect(!valid);
 }
 
 test "validateMnemonic rejects empty input" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator, "");
+    const valid = validateMnemonic("");
     try testing.expect(!valid);
 }
 
 test "validateMnemonic rejects single word" {
-    const allocator = testing.allocator;
-    const valid = try validateMnemonic(allocator, "abandon");
+    const valid = validateMnemonic("abandon");
     try testing.expect(!valid);
 }
 
 test "round-trip: generated mnemonic validates" {
-    const allocator = testing.allocator;
     const test_entropies = [_][16]u8{
         [_]u8{0x00} ** 16,
         [_]u8{0xFF} ** 16,
@@ -512,19 +418,14 @@ test "round-trip: generated mnemonic validates" {
     };
 
     for (&test_entropies) |*entropy| {
-        var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        crypto.hash.sha2.Sha256.hash(entropy, &hash, .{});
-
-        const phrase = try generateMnemonic(allocator, entropy, hash[0]);
-        defer allocator.free(phrase);
-
-        const valid = try validateMnemonic(allocator, phrase);
+        var buf: [1024]u8 = undefined;
+        const phrase = generateMnemonic(entropy, &buf);
+        const valid = validateMnemonic(phrase);
         try testing.expect(valid);
     }
 }
 
 test "round-trip 256-bit: generated mnemonic validates" {
-    const allocator = testing.allocator;
     const test_entropies = [_][32]u8{
         [_]u8{0x00} ** 32,
         [_]u8{0xFF} ** 32,
@@ -532,26 +433,17 @@ test "round-trip 256-bit: generated mnemonic validates" {
     };
 
     for (&test_entropies) |*entropy| {
-        var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        crypto.hash.sha2.Sha256.hash(entropy, &hash, .{});
-
-        const phrase = try generateMnemonic(allocator, entropy, hash[0]);
-        defer allocator.free(phrase);
-
-        const valid = try validateMnemonic(allocator, phrase);
+        var buf: [1024]u8 = undefined;
+        const phrase = generateMnemonic(entropy, &buf);
+        const valid = validateMnemonic(phrase);
         try testing.expect(valid);
     }
 }
 
 test "BIP39 test vector: 7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0x7f} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0x7f} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "legal winner thank year wave sausage worth useful legal winner thank yellow",
         phrase,
@@ -559,14 +451,9 @@ test "BIP39 test vector: 7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f" {
 }
 
 test "BIP39 test vector: 80808080808080808080808080808080" {
-    const allocator = testing.allocator;
-    var entropy = [_]u8{0x80} ** 16;
-    var hash: [crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    crypto.hash.sha2.Sha256.hash(&entropy, &hash, .{});
-
-    const phrase = try generateMnemonic(allocator, &entropy, hash[0]);
-    defer allocator.free(phrase);
-
+    const entropy = [_]u8{0x80} ** 16;
+    var buf: [1024]u8 = undefined;
+    const phrase = generateMnemonic(&entropy, &buf);
     try testing.expectEqualStrings(
         "letter advice cage absurd amount doctor acoustic avoid letter advice cage above",
         phrase,
