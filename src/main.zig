@@ -82,13 +82,14 @@ fn handleValidate(args: anytype, stdout: anytype, stderr: anytype) !void {
     var pos: usize = 0;
 
     while (args.next()) |word| {
-        if (pos > 0) {
+        const space: usize = if (pos > 0) 1 else 0;
+        if (pos + space + word.len > phrase_buf.len) {
+            try stderr.print("Input too long.\n", .{});
+            std.process.exit(1);
+        }
+        if (space > 0) {
             phrase_buf[pos] = ' ';
             pos += 1;
-        }
-        if (pos + word.len > phrase_buf.len) {
-            try stderr.print("Input too long.\n", .{});
-            return;
         }
         @memcpy(phrase_buf[pos..][0..word.len], word);
         pos += word.len;
@@ -225,14 +226,6 @@ test "wordlist is sorted" {
     for (0..WORDLIST.len - 1) |i| {
         const order = mem.order(u8, WORDLIST[i], WORDLIST[i + 1]);
         try testing.expect(order == .lt);
-    }
-}
-
-test "wordlist has no duplicates" {
-    for (0..WORDLIST.len) |i| {
-        for (i + 1..WORDLIST.len) |j| {
-            try testing.expect(!mem.eql(u8, WORDLIST[i], WORDLIST[j]));
-        }
     }
 }
 

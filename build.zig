@@ -45,8 +45,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(e2e_step);
 }
 
-const StdIoCheck = std.Build.Step.Run.StdIo.Check;
-
 fn expectStdoutContains(run: *std.Build.Step.Run, needle: []const u8) void {
     run.addCheck(.{ .expect_stdout_match = run.step.owner.dupe(needle) });
 }
