@@ -6,7 +6,7 @@ Generates cryptographically random 12- or 24-word mnemonic phrases from the Engl
 
 ## Building
 
-Requires [Zig](https://ziglang.org/download/) 0.13.x.
+Requires [Zig](https://ziglang.org/download/) 0.14.1 or later.
 
 ```
 zig build
