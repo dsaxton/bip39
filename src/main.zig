@@ -16,6 +16,10 @@ const WORDLIST = blk: {
         words[i] = word;
     }
     if (i != words.len) @compileError("Wordlist contains fewer than 2048 words");
+    for (0..WORDLIST_SIZE - 1) |j| {
+        if (mem.order(u8, words[j], words[j + 1]) != .lt)
+            @compileError("Wordlist is not in strict ascending order");
+    }
     break :blk words;
 };
 
