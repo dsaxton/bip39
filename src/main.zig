@@ -464,6 +464,58 @@ test "BIP39 test vector: 80808080808080808080808080808080" {
     );
 }
 
+test "checksum bits are SHA-256 derived and validated" {
+    // 128-bit: 4 checksum bits (top nibble of SHA-256(entropy))
+    {
+        const entropy = [_]u8{0} ** 16;
+        var hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(&entropy, &hash, .{});
+
+        var buf: [1024]u8 = undefined;
+        const phrase = generateMnemonic(&entropy, &buf);
+
+        var last_word: []const u8 = "";
+        var iter = mem.tokenizeScalar(u8, phrase, ' ');
+        while (iter.next()) |w| last_word = w;
+        const last_idx = wordIndex(last_word).?;
+
+        const expected_checksum: u4 = @intCast(hash[0] >> 4);
+        const actual_checksum: u4 = @intCast(last_idx & 0xF);
+        try testing.expectEqual(expected_checksum, actual_checksum);
+    }
+
+    // 256-bit: 8 checksum bits (full first byte of SHA-256(entropy))
+    {
+        const entropy = [_]u8{0} ** 32;
+        var hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(&entropy, &hash, .{});
+
+        var buf: [1024]u8 = undefined;
+        const phrase = generateMnemonic(&entropy, &buf);
+
+        var last_word: []const u8 = "";
+        var iter = mem.tokenizeScalar(u8, phrase, ' ');
+        while (iter.next()) |w| last_word = w;
+        const last_idx = wordIndex(last_word).?;
+
+        const expected_cs: u8 = hash[0];
+        const actual_cs: u8 = @intCast(last_idx & 0xFF);
+        try testing.expectEqual(expected_cs, actual_cs);
+    }
+
+    // Corrupting a checksum-carrying word must cause validation to fail
+    {
+        const entropy = [_]u8{0} ** 16;
+        var buf: [1024]u8 = undefined;
+        const valid_phrase = generateMnemonic(&entropy, &buf);
+        try testing.expect(validateMnemonic(valid_phrase));
+
+        // Replace final word ("about") with "abandon" to corrupt checksum
+        const corrupted = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+        try testing.expect(!validateMnemonic(corrupted));
+    }
+}
+
 test "wordIndex finds known words" {
     try testing.expectEqual(@as(?u11, 0), wordIndex("abandon"));
     try testing.expectEqual(@as(?u11, 2047), wordIndex("zoo"));

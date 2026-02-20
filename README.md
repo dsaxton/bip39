@@ -62,17 +62,30 @@ Validation reverses this: it decodes the words back to 11-bit indices, extracts 
 ## Tests
 
 ```
-zig build test
+zig build test        # run all tests (unit + end-to-end)
+zig build test-e2e    # run only end-to-end CLI tests
 ```
 
-The test suite covers:
+### Unit tests
 
 - **Wordlist integrity** -- exactly 2048 sorted, unique entries
 - **Command parsing** -- all commands, null/unknown input
 - **Bit extraction** -- entropy and checksum bit reading
 - **Generation** -- BIP39 test vectors (all-zero, all-0xFF, 0x7F, 0x80 entropy for both 128-bit and 256-bit)
 - **Validation** -- valid and invalid phrases (wrong word count, unknown words, bad checksum, empty input)
+- **Checksum verification** -- SHA-256 derived checksum bits are correctly embedded in the last word for both 128-bit (4-bit) and 256-bit (8-bit) entropy; corrupted checksums are rejected
 - **Round-trip** -- generated phrases pass validation for a range of entropy patterns
+
+### End-to-end CLI tests
+
+The `test-e2e` step builds the binary and exercises it through its CLI interface, asserting on stdout content, stderr content, and exit codes:
+
+- `bip39 help` and no-argument invocation print usage
+- `bip39 generate`, `generate 12`, `generate 24` exit successfully
+- `bip39 generate 99` warns on stderr but still exits 0
+- `bip39 validate <valid-12-word>` and `<valid-24-word>` print "Valid" and exit 0
+- `bip39 validate <bad-checksum>` and `<unknown-word>` print "Invalid" and exit 1
+- `bip39 validate` with no words prints an error to stderr
 
 ## License
 
